@@ -1,11 +1,13 @@
 package org.aggregateframework.repository;
 
 import org.aggregateframework.SystemException;
-import org.aggregateframework.domainevent.EventMessage;
+import org.aggregateframework.cache.L2Cache;
+import org.aggregateframework.cache.NoL2Cache;
 import org.aggregateframework.entity.AggregateRoot;
 import org.aggregateframework.eventbus.EventBus;
 import org.aggregateframework.eventbus.SimpleEventBus;
-import org.aggregateframework.eventhandling.processor.AsyncMethodInvoker;
+import org.aggregateframework.serializer.KryoPoolSerializer;
+import org.aggregateframework.serializer.ObjectSerializer;
 import org.aggregateframework.session.AggregateEntry;
 import org.aggregateframework.session.LocalSessionFactory;
 import org.aggregateframework.session.SessionFactory;
@@ -31,12 +33,24 @@ public abstract class AbstractAggregateRepository<T extends AggregateRoot<ID>, I
     private EventBus eventBus = SimpleEventBus.INSTANCE;
     private SaveAggregateCallback<T> saveAggregateCallback = new SimpleSaveAggregateCallback();
 
+    protected L2Cache<T, ID> l2Cache = NoL2Cache.INSTANCE;
+
+    protected ObjectSerializer<T> objectSerializer = new KryoPoolSerializer<T>();
+
     protected AbstractAggregateRepository(Class<T> aggregateType) {
         this.aggregateType = aggregateType;
     }
 
     public void setEventBus(EventBus eventBus) {
         this.eventBus = eventBus;
+    }
+
+    public void setL2Cache(L2Cache<T, ID> l2Cache) {
+        this.l2Cache = l2Cache;
+    }
+
+    public void setObjectSerializer(ObjectSerializer<T> objectSerializer) {
+        this.objectSerializer = objectSerializer;
     }
 
     @Override
@@ -46,62 +60,54 @@ public abstract class AbstractAggregateRepository<T extends AggregateRoot<ID>, I
     }
 
     @Override
-    public List<T> save(Collection<T> entities) {
+    public List<T> save(final Collection<T> entities) {
 
-        List<T> result = new ArrayList<T>();
+        return execute(new Callback<List<T>>() {
+            @Override
+            public List<T> execute() {
+                List<T> result = new ArrayList<T>();
 
-        if (CollectionUtils.isEmpty(entities)) {
-            return result;
-        }
+                if (CollectionUtils.isEmpty(entities)) {
+                    return result;
+                }
 
-        AggregateEntry<T> aggregateEntry = new AggregateEntry<T>(entities, saveAggregateCallback, eventBus);
+                AggregateEntry<T> aggregateEntry = new AggregateEntry<T>(entities, saveAggregateCallback, eventBus);
 
-        sessionFactory.requireClientSession().registerAggregate(aggregateEntry);
+                sessionFactory.requireClientSession().registerAggregate(aggregateEntry);
 
-        result.addAll(entities);
-        return result;
+                for (T entity : entities) {
+                    if (!entity.isNew()) {
+                        sessionFactory.requireClientSession().registerToLocalCache(entity);
+                    }
+                }
+
+                result.addAll(entities);
+                return result;
+            }
+        });
     }
 
     @Override
     public void flush() {
-        sessionFactory.requireClientSession().flush();
+        execute(new Callback<Boolean>() {
+            @Override
+            public Boolean execute() {
+                sessionFactory.requireClientSession().flush();
+                return Boolean.TRUE;
+            }
+        });
     }
 
     @Override
-    public T findOne(ID id) {
+    public T findOne(final ID id) {
 
-        T entity = null;
+        List<T> fetchedEntities = findAll(Arrays.asList(id));
 
-        entity = sessionFactory.requireClientSession().findInLocalCache(this.aggregateType, id);
-
-        if (entity != null) {
-            return entity;
+        if (fetchedEntities.size() > 0) {
+            return fetchedEntities.get(0);
         }
 
-//        entity = sharedCacheAdapter.findOne(aggregateType, id);
-
-        if (entity != null) {
-
-            sessionFactory.requireClientSession().registerOriginalCopy(entity);
-            sessionFactory.requireClientSession().registerToLocalCache(entity);
-
-            return entity;
-        }
-
-        entity = doFindOne(id);
-
-        if (entity == null) {
-            return null;
-        }
-
-        entity.clearDomainEvents();
-
-//        sharedCacheAdapter.save(this.aggregateType, entity);
-
-        sessionFactory.requireClientSession().registerOriginalCopy(entity);
-        sessionFactory.requireClientSession().registerToLocalCache(entity);
-
-        return entity;
+        return null;
     }
 
     @Override
@@ -119,48 +125,50 @@ public abstract class AbstractAggregateRepository<T extends AggregateRoot<ID>, I
     }
 
     @Override
-    public List<T> findAll(Collection<ID> ids) {
+    public List<T> findAll(final Collection<ID> ids) {
 
-        List<T> entities = new ArrayList<T>();
+        return execute(new Callback<List<T>>() {
+            @Override
+            public List<T> execute() {
+                List<T> entities = new ArrayList<T>();
 
-        if (CollectionUtils.isEmpty(ids)) {
-            return entities;
-        }
+                if (CollectionUtils.isEmpty(ids)) {
+                    return entities;
+                }
 
-        List<ID> idsNeedFetch = new ArrayList<ID>(ids);
+                List<ID> idsNeedFetch = new ArrayList<ID>(ids);
 
-        List<ID> idsInLocalCache = new ArrayList<ID>();
+                List<ID> idsInLocalCache = new ArrayList<ID>();
 
-        List<T> entitiesNotInCache = new ArrayList<T>();
+                for (ID id : idsNeedFetch) {
 
+                    T localCachedEntity = sessionFactory.requireClientSession().findInLocalCache(aggregateType, id);
 
-        for (ID id : idsNeedFetch) {
-            T cachedEntity = sessionFactory.requireClientSession().findInLocalCache(this.aggregateType, id);
+                    if (localCachedEntity != null) {
 
-            if (cachedEntity != null) {
+                        entities.add(localCachedEntity);
+                        idsInLocalCache.add(id);
+                    }
+                }
 
-                entities.add(cachedEntity);
-                idsInLocalCache.add(id);
+                idsNeedFetch.removeAll(idsInLocalCache);
+
+                if (!CollectionUtils.isEmpty(idsNeedFetch)) {
+
+                    Collection<T> fetchedEntitiesFromStore = findFromStore(idsNeedFetch);
+
+                    for (T entity : fetchedEntitiesFromStore) {
+                        T localEntity = objectSerializer.clone(entity);
+                        sessionFactory.requireClientSession().registerToLocalCache(localEntity);
+                        entities.add(localEntity);
+                    }
+                }
+
+                return entities;
             }
-        }
-
-        idsNeedFetch.removeAll(idsInLocalCache);
-
-        if (!CollectionUtils.isEmpty(idsNeedFetch))
-
-        {
-            Collection<T> foundEntities = doFindAll(idsNeedFetch);
-            entities.addAll(foundEntities);
-            entitiesNotInCache.addAll(foundEntities);
-        }
-
-        for (T entity : entitiesNotInCache) {
-            sessionFactory.requireClientSession().registerOriginalCopy(entity);
-            sessionFactory.requireClientSession().registerToLocalCache(entity);
-        }
-
-        return entities;
+        });
     }
+
 
     @Override
     public long count() {
@@ -201,29 +209,38 @@ public abstract class AbstractAggregateRepository<T extends AggregateRoot<ID>, I
         }
     }
 
-    protected List<T> tryFetchFreshEntities(List<T> sharedEntities) {
+    protected Collection<T> findFromStore(Collection<ID> ids) {
 
-        List<T> resultEntities = new ArrayList<T>();
+        Collection<ID> needFetchedIds = new ArrayList<ID>(ids);
 
-        for (T sharedEntity : sharedEntities) {
-            resultEntities.add(tryFetchFreshEntity(sharedEntity));
+        Collection<T> fetchedEntities = new ArrayList<T>();
+
+        if (!CollectionUtils.isEmpty(needFetchedIds)) {
+
+            Collection<T> fetchedEntitiesFromL2Cache = l2Cache.findAll(aggregateType, needFetchedIds);
+
+            List<ID> idsFetchedFromL2Cache = new ArrayList<ID>();
+
+            for (T entity : fetchedEntitiesFromL2Cache) {
+                idsFetchedFromL2Cache.add(entity.getId());
+            }
+
+            needFetchedIds.removeAll(idsFetchedFromL2Cache);
+
+            Collection<T> fetchedEntitiesFromStore = doFindAll(needFetchedIds);
+            l2Cache.write(fetchedEntitiesFromStore);
+
+
+            fetchedEntities.addAll(fetchedEntitiesFromL2Cache);
+            fetchedEntities.addAll(fetchedEntitiesFromStore);
+
+            for (T entity : fetchedEntities) {
+                entity.clearDomainEvents();
+                sessionFactory.requireClientSession().registerOriginalCopy(entity);
+            }
         }
 
-        return resultEntities;
-    }
-
-    protected T tryFetchFreshEntity(T sharedEntity) {
-
-        T localCacheEntity = sessionFactory.requireClientSession().findInLocalCache(this.aggregateType, sharedEntity.getId());
-
-        if (localCacheEntity == null) {
-
-            sessionFactory.requireClientSession().registerOriginalCopy(sharedEntity);
-            sessionFactory.requireClientSession().registerToLocalCache(sharedEntity);
-            return sharedEntity;
-        } else {
-            return localCacheEntity;
-        }
+        return fetchedEntities;
     }
 
     protected abstract Collection<T> doSave(Collection<T> entities);
@@ -244,27 +261,77 @@ public abstract class AbstractAggregateRepository<T extends AggregateRoot<ID>, I
         @Override
         public void save(final Collection<T> aggregateRoots) {
 
-            List<T> removedAggregates = new ArrayList<T>();
+            List<T> needRemoveAggregates = new ArrayList<T>();
 
-            List<T> updatedAggregates = new ArrayList<T>();
+            List<T> needSaveAggregates = new ArrayList<T>();
+
+            List<T> newAggregates = new ArrayList<T>();
 
             for (T aggregate : aggregateRoots) {
                 if (aggregate.isDeleted()) {
-                    removedAggregates.add(aggregate);
+                    needRemoveAggregates.add(aggregate);
                 } else {
-                    updatedAggregates.add(aggregate);
+                    needSaveAggregates.add(aggregate);
+
+                    if (aggregate.isNew()) {
+                        newAggregates.add(aggregate);
+                    }
                 }
             }
 
-            if (!CollectionUtils.isEmpty(removedAggregates)) {
-                doRemove(removedAggregates);
+            if (!CollectionUtils.isEmpty(needRemoveAggregates)) {
+
+                doRemove(needRemoveAggregates);
+
+                sessionFactory.requireClientSession().attachL2Cache(aggregateType, l2Cache);
+                sessionFactory.requireClientSession().removeFromL2Cache(needRemoveAggregates);
+
             }
 
-            if (!CollectionUtils.isEmpty(updatedAggregates)) {
-                doSave(updatedAggregates);
+            if (!CollectionUtils.isEmpty(needSaveAggregates)) {
+
+                doSave(needSaveAggregates);
+
+                sessionFactory.requireClientSession().attachL2Cache(aggregateType, l2Cache);
+                sessionFactory.requireClientSession().writeToL2Cache(needSaveAggregates);
+            }
+
+            for (T entity : aggregateRoots) {
+                sessionFactory.requireClientSession().registerToLocalCache(entity);
+            }
+
+            for (T entity : newAggregates) {
+                T clonedEntity = objectSerializer.clone(entity);
+                sessionFactory.requireClientSession().registerOriginalCopy(clonedEntity);
             }
         }
 
     }
 
+    private <E> E execute(Callback<E> callback) {
+
+        boolean success = sessionFactory.registerClientSession(false);
+
+        try {
+
+            E result = callback.execute();
+
+            if (success) {
+                sessionFactory.requireClientSession().commit();
+                sessionFactory.requireClientSession().flushToL2Cache();
+                sessionFactory.requireClientSession().postHandle();
+            }
+
+            return result;
+
+        } finally {
+            if (success) {
+                sessionFactory.closeClientSession();
+            }
+        }
+    }
+
+    public interface Callback<E> {
+        E execute();
+    }
 }

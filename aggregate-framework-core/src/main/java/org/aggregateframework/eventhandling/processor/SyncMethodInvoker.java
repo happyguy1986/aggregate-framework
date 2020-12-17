@@ -1,18 +1,22 @@
 package org.aggregateframework.eventhandling.processor;
 
 import org.aggregateframework.SystemException;
+import org.aggregateframework.eventhandling.EventHandlerHook;
 import org.aggregateframework.eventhandling.EventInvokerEntry;
-import org.aggregateframework.eventhandling.annotation.Retryable;
-import org.aggregateframework.eventhandling.processor.retry.*;
-import org.apache.commons.lang3.StringUtils;
+import org.aggregateframework.eventhandling.annotation.EventHandler;
+import org.mengyun.commons.bean.FactoryBuilder;
+import org.mengyun.compensable.transaction.repository.TransactionRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
  * Created by changming.xie on 2/4/16.
  */
 public class SyncMethodInvoker {
+
+    static final Logger logger = LoggerFactory.getLogger(SyncMethodInvoker.class);
 
     private static volatile SyncMethodInvoker INSTANCE = null;
 
@@ -31,65 +35,45 @@ public class SyncMethodInvoker {
         return INSTANCE;
     }
 
-    public void invoke(EventInvokerEntry eventInvokerEntry) {
+    public void invoke(final EventInvokerEntry eventInvokerEntry) {
+
         final Method method = eventInvokerEntry.getMethod();
         final Object target = eventInvokerEntry.getTarget();
         final Object[] params = eventInvokerEntry.getParams();
 
-        final Retryable retryable = method.getAnnotation(Retryable.class);
+        try {
 
-        if (retryable == null) {
+            long start = System.currentTimeMillis();
+
             try {
+                EventHandlerHook.INSTANCE.beforeEventHandler(target, method, params);
                 method.invoke(target, params);
-            } catch (IllegalAccessException e) {
-                throw new SystemException(e);
-            } catch (InvocationTargetException e) {
-                if (e.getCause() != null) {
-                    if (e.getCause() instanceof RuntimeException) {
-                        throw (RuntimeException) (e.getCause());
-                    }
-                }
-
-                throw new SystemException(e);
-            }
-        } else {
-
-            final PolicyBuilder policyBuilder = new PolicyBuilder();
-            RetryTemplate retryTemplate = new RetryTemplate();
-
-            RetryPolicy retryPolicy = policyBuilder.getRetryPolicy(retryable);
-            retryTemplate.setRetryPolicy(retryPolicy);
-            retryTemplate.setBackOffPolicy(policyBuilder.getBackoffPolicy(retryable.backoff()));
-
-            RetryContext retryContext = retryPolicy.requireRetryContext();
-
-            RetryCallback<Object> retryCallback = new RetryCallback<Object>() {
-                @Override
-                public Object doWithRetry(RetryContext context) {
-                    try {
-                        return method.invoke(target, params);
-                    } catch (IllegalAccessException e) {
-                        throw new SystemException(e);
-                    } catch (InvocationTargetException e) {
-                        if (e.getCause() != null) {
-                            if (e.getCause() instanceof RuntimeException) {
-                                throw (RuntimeException) (e.getCause());
-                            }
-                        }
-
-                        throw new SystemException(e);
-                    }
-                }
-            };
-
-            RecoveryCallback<Object> recoveryCallback = null;
-
-            if (StringUtils.isNotEmpty(retryable.recoverMethod())) {
-                recoveryCallback = new SimpleRecoveryCallback(target, retryable.recoverMethod(), method.getParameterTypes(), params);
+            } catch (Exception e) {
+                EventHandlerHook.INSTANCE.afterEventHandler(target, method, params, e);
+                throw e;
             }
 
-            retryTemplate.execute(retryContext, retryCallback, recoveryCallback);
+            long end = System.currentTimeMillis();
+            if (end - start > 100) {
+                logger.info("EventHandler [{}.{}] called use: {} ms",
+                        target.getClass().getSimpleName(),
+                        method.getName(),
+                        (end - start));
+            }
 
+            EventHandlerHook.INSTANCE.afterEventHandler(target, method, params, null);
+
+            if (eventInvokerEntry.getTransaction() != null) {
+
+                EventHandler eventHandler = method.getAnnotation(EventHandler.class);
+
+                TransactionRepository transactionRepository = FactoryBuilder.factoryOf(TransactionRepository.class).getInstance(eventHandler.transactionCheck().compensableTransactionRepository());
+
+                transactionRepository.delete(eventInvokerEntry.getTransaction());
+            }
+
+        } catch (Throwable e) {
+            throw new SystemException(e);
         }
     }
 }

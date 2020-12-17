@@ -2,6 +2,8 @@ package org.aggregateframework.eventhandling;
 
 import org.aggregateframework.domainevent.EventMessage;
 
+import java.util.List;
+
 /**
  * User: changming.xie
  * Date: 14-7-10
@@ -9,5 +11,5 @@ import org.aggregateframework.domainevent.EventMessage;
  */
 public interface EventListener {
 
-    void handle(EventMessage event);
+    List<EventInvokerEntry> matchHandler(List<EventMessage> event);
 }

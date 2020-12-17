@@ -1,16 +1,14 @@
 package org.aggregateframework.eventhandling;
 
-import org.aggregateframework.eventhandling.annotation.EventHandler;
-import org.aggregateframework.eventhandling.processor.EventHandlerProcessor;
-import org.aggregateframework.utils.ReflectionUtils;
+import org.aggregateframework.SystemException;
 import org.aggregateframework.domainevent.EventMessage;
-import org.aggregateframework.session.LocalSessionFactory;
+import org.aggregateframework.eventhandling.annotation.EventHandler;
+import org.aggregateframework.utils.ReflectionUtils;
 
 import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.LinkedList;
-import java.util.List;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.util.*;
 
 /**
  * User: changming.xie
@@ -61,23 +59,60 @@ public class AnnotationEventListenerAdapter implements SimpleEventListenerProxy 
         return target.getClass();
     }
 
-    @Override
-    public void handle(EventMessage event) {
+    public List<EventInvokerEntry> matchHandler(List<EventMessage> events) {
+
+        Map<Class, List<Object>> eventMap = new LinkedHashMap<Class, List<Object>>();
+
+        for (EventMessage event : events) {
+
+            if (!eventMap.containsKey(event.getPayloadType())) {
+                eventMap.put(event.getPayloadType(), new ArrayList<Object>());
+            }
+
+            eventMap.get(event.getPayloadType()).add(event.getPayload());
+        }
+
+        List<EventInvokerEntry> eventInvokerEntries = new ArrayList<EventInvokerEntry>();
 
         for (Method method : methods) {
 
-            Class<?>[] classes = method.getParameterTypes();
-            if (classes != null && classes.length > 0) {
-                for (Class<?> clazz : classes) {
-                    if (clazz.equals(event.getPayloadType())) {
-                        EventInvokerEntry eventInvokerEntry = new EventInvokerEntry(event.getPayloadType(),method, this.target, event.getPayload());
-                        handle(eventInvokerEntry);
+            Type[] types = method.getGenericParameterTypes();
 
-                        break;
+            if (types != null && types.length > 0) {
+
+                for (Type type : types) {
+
+                    for (Map.Entry<Class, List<Object>> entry : eventMap.entrySet()) {
+
+                        if (isTypeEqual(type, entry.getKey())) {
+
+                            if (types.length > 1) {
+                                throw new SystemException(String.format("invalid method parameters, class:%s, method:%s", method.getClass().getName(), method.getName()));
+                            } else {
+                                for (Object param : entry.getValue()) {
+                                    EventInvokerEntry eventInvokerEntry = new EventInvokerEntry(entry.getKey(), method, this.target, param);
+                                    eventInvokerEntries.add(eventInvokerEntry);
+                                }
+                            }
+                        } else if (isCollectionOfType(type, entry.getKey())) {
+
+                            if (types.length > 1) {
+                                throw new SystemException(String.format("invalid method parameters, class:%s, method:%s", method.getClass().getName(), method.getName()));
+                            } else {
+
+                                EventInvokerEntry eventInvokerEntry = new EventInvokerEntry(entry.getKey(), method, this.target, entry.getValue());
+                                eventInvokerEntries.add(eventInvokerEntry);
+                            }
+                        }
+                        //break;
                     }
+
+                    break;
                 }
             }
         }
+
+        return eventInvokerEntries;
     }
 
     @Override
@@ -109,17 +144,26 @@ public class AnnotationEventListenerAdapter implements SimpleEventListenerProxy 
         return this.target.equals(that.target);
     }
 
+    private boolean isCollectionOfType(Type type, Class targetClass) {
 
-    private void handle(EventInvokerEntry eventInvokerEntry) {
-        EventHandler eventHandler = ReflectionUtils.getAnnotation(eventInvokerEntry.getMethod(), EventHandler.class);
-//        if (eventHandler == null) {
-//            return;
-//        }
+        if (type instanceof ParameterizedType) {
+            ParameterizedType parameterizedType = (ParameterizedType) type;
 
-        if (eventHandler.postAfterTransaction()) {
-            LocalSessionFactory.INSTANCE.requireClientSession().addPostInvoker(eventInvokerEntry);
-        } else {
-            EventHandlerProcessor.proceed(eventInvokerEntry);
+            if ((parameterizedType.getRawType() instanceof Class)
+                    && Collection.class.isAssignableFrom((Class) parameterizedType.getRawType())) {
+                for (Type actualType : parameterizedType.getActualTypeArguments()) {
+                    if (actualType.equals(targetClass)) {
+                        return true;
+                    }
+                }
+            }
         }
+
+        return false;
     }
+
+    private boolean isTypeEqual(Type type, Class targetClass) {
+        return type.equals(targetClass);
+    }
+
 }

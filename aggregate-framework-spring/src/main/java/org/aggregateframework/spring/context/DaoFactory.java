@@ -1,11 +1,15 @@
 package org.aggregateframework.spring.context;
 
 import org.aggregateframework.NoDaoDefinitionException;
+import org.aggregateframework.dao.AggregateDao;
 import org.aggregateframework.dao.DomainObjectDao;
 import org.aggregateframework.entity.AbstractDomainObject;
 import org.aggregateframework.entity.DomainObject;
+import org.mengyun.commons.bean.FactoryBuilder;
+import org.mengyun.commons.context.SpringBeanFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.AnnotationUtils;
 
 import java.io.Serializable;
 import java.lang.reflect.ParameterizedType;
@@ -29,16 +33,24 @@ public class DaoFactory {
         foundDao = daoMap.get(entityClass);
 
         if (foundDao == null) {
-            
+
             synchronized (entityClass) {
 
                 foundDao = daoMap.get(entityClass);
 
                 if (foundDao == null) {
 
-                    Map<String, DomainObjectDao> daos = SpringObjectFactory.getApplicationContext().getBeansOfType(DomainObjectDao.class);
+                    Map<String, DomainObjectDao> daos = FactoryBuilder.getFactory(SpringBeanFactory.class).getBeansOfType(DomainObjectDao.class);
 
                     for (DomainObjectDao<E, ID> dao : daos.values()) {
+
+                        AggregateDao aggregateDao = AnnotationUtils.findAnnotation(dao.getClass(), AggregateDao.class);
+
+                        if (aggregateDao != null && isEntityClassMatch(aggregateDao.value(), entityClass)) {
+                            foundDao = dao;
+                            daoMap.put(entityClass, foundDao);
+                            return foundDao;
+                        }
 
                         Class[] classes = dao.getClass().getInterfaces();
 

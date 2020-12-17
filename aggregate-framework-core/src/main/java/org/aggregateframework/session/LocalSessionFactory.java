@@ -1,7 +1,7 @@
 package org.aggregateframework.session;
 
+import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.LinkedList;
 
 /**
  * User: changming.xie
@@ -14,31 +14,34 @@ public class LocalSessionFactory implements SessionFactory {
 
     private static final ThreadLocal<Deque<SessionEntry>> CURRENT = new ThreadLocal<Deque<SessionEntry>>();
 
-    private static boolean isEmpty() {
-        Deque<SessionEntry> session = CURRENT.get();
-        return session == null || session.isEmpty();
-    }
-
     @Override
-    public ClientSession registerClientSession(ClientSession clientClientSession) {
+    public boolean registerClientSession(boolean requireNew) {
 
-        if (CURRENT.get() == null) {
-            CURRENT.set(new LinkedList<SessionEntry>());
+        if (requireNew) {
+
+            if (CURRENT.get() == null) {
+                CURRENT.set(new ArrayDeque<SessionEntry>());
+            }
+
+            CURRENT.get().push(new SessionEntry(new UnitOfWork()));
+            return true;
+        } else {
+
+            if (CURRENT.get() == null) {
+                CURRENT.set(new ArrayDeque<SessionEntry>());
+                CURRENT.get().push(new SessionEntry(new UnitOfWork()));
+                return true;
+            } else if (CURRENT.get().peek() == null) {
+                CURRENT.get().push(new SessionEntry(new UnitOfWork()));
+                return true;
+            }
+
+            return false;
         }
-
-        CURRENT.get().push(new SessionEntry(clientClientSession));
-        return requireClientSession();
     }
 
     @Override
     public ClientSession requireClientSession() {
-        if (isEmpty()) {
-            if (CURRENT.get() == null) {
-                CURRENT.set(new LinkedList<SessionEntry>());
-            }
-
-            CURRENT.get().push(new SessionEntry(new NoClientSession()));
-        }
         return CURRENT.get().peek().getClientSession();
     }
 
@@ -48,6 +51,7 @@ public class LocalSessionFactory implements SessionFactory {
     }
 
     class SessionEntry {
+
         private ClientSession clientSession;
 
         public SessionEntry(ClientSession clientSession) {

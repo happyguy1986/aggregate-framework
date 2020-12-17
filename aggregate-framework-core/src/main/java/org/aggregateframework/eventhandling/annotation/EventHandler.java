@@ -13,7 +13,14 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.METHOD)
 public @interface EventHandler {
+
     boolean asynchronous() default false;
 
+    AsyncConfig asyncConfig() default @AsyncConfig();
+
     boolean postAfterTransaction() default false;
+
+    boolean isTransactionMessage() default false;
+
+    TransactionCheck transactionCheck() default @TransactionCheck();
 }
